@@ -10,11 +10,17 @@ module.exports = async (req, res) => {
   const OPENAI_API_KEY = process.env.OPENAI_API_KEY || "";
   const OPENAI_MODEL   = process.env.OPENAI_MODEL || "gpt-4o-mini";
   const GEMINI_API_KEY = process.env.GEMINI_API_KEY || "";
+  const GEMINI_MODEL   = process.env.GEMINI_MODEL || "gemini-1.5-flash-latest";
 
   // Sağlık bilgisi
   if (req.method === "GET") {
     const provider = OPENAI_API_KEY ? "openai" : (GEMINI_API_KEY ? "gemini" : "none");
-    return res.status(200).json({ ok: true, provider, model: provider === "openai" ? OPENAI_MODEL : "gemini-1.5-flash" });
+    return res.status(200).json({
+      ok: true,
+      provider,
+      openai_model: OPENAI_MODEL,
+      gemini_model: GEMINI_MODEL
+    });
   }
 
   if (req.method !== "POST") {
@@ -75,21 +81,20 @@ module.exports = async (req, res) => {
   }
 
   async function callGemini() {
-    const url = `https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key=${GEMINI_API_KEY}`;
+    const url = `https://generativelanguage.googleapis.com/v1beta/models/${GEMINI_MODEL}:generateContent?key=${GEMINI_API_KEY}`;
     const r = await fetch(url, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
-        contents: [{ parts: [{ text: finalPrompt }] }],
-        generationConfig: { temperature }
+        contents: [{ parts: [{ text: finalPrompt }] }]
       })
     });
-    const text = await r.text();
+    const bodyText = await r.text();
     if (!r.ok) {
-      return { ok: false, status: r.status, raw: text };
+      return { ok: false, status: r.status, raw: bodyText };
     }
-    const j = JSON.parse(text);
-    const output = j?.candidates?.[0]?.content?.parts?.[0]?.text ?? "";
+    const j = JSON.parse(bodyText);
+    const output = j?.candidates?.[0]?.content?.parts?.map(p => p.text).join("") ?? "";
     return { ok: true, output };
   }
 
