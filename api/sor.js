@@ -1,5 +1,5 @@
 // api/sor.js
-// Basit GET/POST + OpenAI→Gemini otomatik fallback
+// Basit GET/POST + OpenAI→Gemini otomatik fallback (v1 endpoint, -latest fallback, provider seçimi)
 module.exports = async (req, res) => {
   // CORS
   res.setHeader("Access-Control-Allow-Origin", "*");
@@ -36,7 +36,7 @@ module.exports = async (req, res) => {
   const prompt      = String(body.prompt || "").trim();
   const lang        = String(body.lang || "tr");
   const temperature = typeof body.temperature === "number" ? body.temperature : 0.7;
-  let   providerReq = String(body.provider || "").trim().toLowerCase();
+  let providerReq   = String(body.provider || "").trim().toLowerCase();
 
   if (!prompt) return res.status(400).json({ error: "prompt_required" });
 
@@ -49,6 +49,56 @@ module.exports = async (req, res) => {
 
   const finalPrompt = `${instruction}\n\n${prompt}`;
 
+  // --- OpenAI çağrısı (değiştirme) ---
+  async function callOpenAI(finalPrompt, temperature) {
+    const r = await fetch("https://api.openai.com/v1/chat/completions", {
+      method: "POST",
+      headers: {
+        "Authorization": `Bearer ${OPENAI_API_KEY}`,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({
+        model: OPENAI_MODEL,
+        messages: [{ role: "user", content: finalPrompt }],
+        temperature,
+      }),
+    });
+    if (!r.ok) throw new Error("openai_http_" + r.status);
+    const j = await r.json();
+    return j?.choices?.[0]?.message?.content ?? "";
+  }
+
+  // --- Gemini çağrısı (v1 endpoint + -latest destekli) ---
+  async function callGemini(finalPrompt) {
+    const url = `https://generativelanguage.googleapis.com/v1/models/${GEMINI_MODEL}:generateContent?key=${GEMINI_API_KEY}`;
+    const r = await fetch(url, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        contents: [{ role: "user", parts: [{ text: finalPrompt }] }],
+      }),
+    });
+    if (!r.ok) {
+      // Bazı hesaplarda -latest 404 verebiliyor → hızlı geri dönüş
+      if (r.status === 404 && GEMINI_MODEL.endsWith("-latest")) {
+        const fallback = `https://generativelanguage.googleapis.com/v1/models/gemini-1.5-flash:generateContent?key=${GEMINI_API_KEY}`;
+        const r2 = await fetch(fallback, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            contents: [{ role: "user", parts: [{ text: finalPrompt }] }],
+          }),
+        });
+        if (!r2.ok) throw new Error("gemini_http_" + r2.status);
+        const j2 = await r2.json();
+        return j2?.candidates?.[0]?.content?.parts?.[0]?.text ?? "";
+      }
+      throw new Error("gemini_http_" + r.status);
+    }
+    const j = await r.json();
+    return j?.candidates?.[0]?.content?.parts?.[0]?.text ?? "";
+  }
+
   // Sağlayıcı seçimi (elle belirtilmediyse otomatik)
   if (!providerReq) {
     providerReq = OPENAI_API_KEY ? "openai" : (GEMINI_API_KEY ? "gemini" : "none");
@@ -57,87 +107,26 @@ module.exports = async (req, res) => {
     return res.status(500).json({ error: "no_provider_configured" });
   }
 
-  // Yardımcı çağrılar
-  async function callOpenAI() {
-    const r = await fetch("https://api.openai.com/v1/chat/completions", {
-      method: "POST",
-      headers: {
-        "Authorization": `Bearer ${OPENAI_API_KEY}`,
-        "Content-Type": "application/json"
-      },
-      body: JSON.stringify({
-        model: OPENAI_MODEL,
-        messages: [{ role: "user", content: finalPrompt }],
-        temperature
-      })
-    });
-    const text = await r.text();
-    if (!r.ok) {
-      return { ok: false, status: r.status, raw: text };
-    }
-    const j = JSON.parse(text);
-    const output = j?.choices?.[0]?.message?.content ?? "";
-    return { ok: true, output };
-  }
-
-  async function callGemini() {
-    const url = `https://generativelanguage.googleapis.com/v1beta/models/${GEMINI_MODEL}:generateContent?key=${GEMINI_API_KEY}`;
-    const r = await fetch(url, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({
-        contents: [{ parts: [{ text: finalPrompt }] }]
-      })
-    });
-    const bodyText = await r.text();
-    if (!r.ok) {
-      return { ok: false, status: r.status, raw: bodyText };
-    }
-    const j = JSON.parse(bodyText);
-    const output = j?.candidates?.[0]?.content?.parts?.map(p => p.text).join("") ?? "";
-    return { ok: true, output };
-  }
+  let output = "";
+  let used = "openai";
 
   try {
-    // 1) Sağlayıcı açıkça GEMINI ise
     if (providerReq === "gemini") {
-      if (!GEMINI_API_KEY) return res.status(500).json({ error: "gemini_key_missing" });
-      const g = await callGemini();
-      if (!g.ok) return res.status(500).json({ error: "gemini_request_failed", status: g.status, body: g.raw });
-      return res.status(200).json({ provider: "gemini", output: g.output, lang });
+      used = "gemini";
+      output = await callGemini(finalPrompt);
+    } else {
+      // openai veya auto → önce OpenAI
+      output = await callOpenAI(finalPrompt, temperature);
     }
-
-    // 2) Sağlayıcı OPENAI ise (veya otomatik seçim openai çıktıysa)
-    if (providerReq === "openai") {
-      if (!OPENAI_API_KEY) {
-        // Key yoksa gerekirse direkt Gemini'ye düş
-        if (GEMINI_API_KEY) {
-          const g = await callGemini();
-          if (!g.ok) return res.status(500).json({ error: "gemini_request_failed", status: g.status, body: g.raw });
-          return res.status(200).json({ provider: "gemini", fallbackFrom: "openai", output: g.output, lang });
-        }
-        return res.status(500).json({ error: "openai_key_missing" });
-      }
-      const o = await callOpenAI();
-      if (o.ok) {
-        return res.status(200).json({ provider: "openai", output: o.output, lang });
-      }
-      // Otomatik fallback: 401/429 (kimlik/limit) gibi durumlarda Gemini'yi dene
-      if ((o.status === 401 || o.status === 429) && GEMINI_API_KEY) {
-        const g = await callGemini();
-        if (!g.ok) {
-          return res.status(500).json({ error: "gemini_request_failed", status: g.status, body: g.raw, fallbackFrom: "openai" });
-        }
-        return res.status(200).json({ provider: "gemini", fallbackFrom: "openai", output: g.output, lang });
-      }
-      // Diğer OpenAI hataları
-      return res.status(500).json({ error: "openai_request_failed", status: o.status, body: o.raw });
-    }
-
-    // 3) Bilinmeyen provider
-    return res.status(400).json({ error: "unknown_provider", provider: providerReq });
-
   } catch (e) {
-    return res.status(500).json({ error: "upstream_error", detail: String(e?.message || e) });
+    // OpenAI hata verirse ve Gemini anahtarı varsa → Gemini’ye düş
+    if (used === "openai" && GEMINI_API_KEY) {
+      used = "gemini";
+      output = await callGemini(finalPrompt);
+    } else {
+      return res.status(500).json({ error: String(e.message || e) });
+    }
   }
+
+  return res.status(200).json({ provider: used, output, lang });
 };
