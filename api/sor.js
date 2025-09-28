@@ -1,146 +1,102 @@
-// api/sor.js
+// api/sor.js — OpenAI -> (gerekirse) Gemini fallback, sadece v1 + stabil modeller
 const OPENAI_API_KEY = process.env.OPENAI_API_KEY || "";
 const OPENAI_MODEL   = process.env.OPENAI_MODEL   || "gpt-4o-mini";
 
-const GEMINI_API_KEY     = process.env.GEMINI_API_KEY     || "";
-const GEMINI_API_VERSION = process.env.GEMINI_API_VERSION || "v1beta";
-const GEMINI_MODEL       = process.env.GEMINI_MODEL       || "gemini-1.5-flash-latest";
+const GEMINI_API_KEY     = process.env.GEMINI_API_KEY || "";
+const GEMINI_API_VERSION = (process.env.GEMINI_API_VERSION || "v1").trim(); // v1 KULLAN
+const GEMINI_MODEL_MAIN  = (process.env.GEMINI_MODEL || "gemini-1.5-flash").trim();
 
-// ---- Yardımcılar (throw YOK; hep JSON döndürür) ----
-async function askOpenAI(prompt, temperature) {
-  if (!OPENAI_API_KEY) return { ok: false, error: "openai_not_configured" };
-  try {
-    const r = await fetch("https://api.openai.com/v1/chat/completions", {
-      method: "POST",
-      headers: {
-        "Authorization": `Bearer ${OPENAI_API_KEY}`,
-        "Content-Type": "application/json"
-      },
-      body: JSON.stringify({
-        model: OPENAI_MODEL,
-        messages: [{ role: "user", content: prompt}],
-        temperature
-      })
-    });
-    const text = await r.text();
-    if (!r.ok) return { ok: false, error: "openai_http_" + r.status, body: text };
-    const j = JSON.parse(text);
-    const output = j?.choices?.[0]?.message?.content ?? "";
-    return { ok: true, provider: "openai", output };
-  } catch (e) {
-    return { ok: false, error: "openai_exception", detail: String(e) };
-  }
+// Sadece destekli modeller
+const GEMINI_MODEL_FALLBACKS = [
+  GEMINI_MODEL_MAIN,
+  "gemini-1.5-flash",
+  "gemini-1.5-pro"
+];
+
+function langInstruction(lang) {
+  if (lang === "tr") return "Lütfen sadece Türkçe yanıt ver.";
+  if (lang === "en") return "Please respond in English only.";
+  return "Please respond in English only.";
 }
 
-async function askGemini(prompt) {
-  if (!GEMINI_API_KEY) return { ok: false, error: "gemini_not_configured" };
+async function askOpenAI(finalPrompt, temperature = 0.7) {
+  if (!OPENAI_API_KEY) throw new Error("openai_no_key");
+  const r = await fetch("https://api.openai.com/v1/chat/completions", {
+    method: "POST",
+    headers: { "Authorization": `Bearer ${OPENAI_API_KEY}", "Content-Type": "application/json" },
+    body: JSON.stringify({ model: OPENAI_MODEL, messages: [{ role: "user", content: finalPrompt }], temperature })
+  });
+  if (!r.ok) { const txt = await r.text(); const e = new Error("openai_http_" + r.status); e.body = txt; throw e; }
+  const j = await r.json();
+  return j?.choices?.[0]?.message?.content ?? "";
+}
 
-  const versions = [...new Set([GEMINI_API_VERSION, "v1beta"])]
-  const models   = [...new Set([GEMINI_MODEL, "gemini-1.5-flash-latest", "gemini-1.5-flash", "gemini-1.5-flash-8b"])]
+async function askGeminiWithModel(finalPrompt, model, version, temperature = 0.7) {
+  if (!GEMINI_API_KEY) throw new Error("gemini_no_key");
+  const base = version === "v1" 
+    ? `https://generativelanguage.googleapis.com/v1/models/${model}:generateContent`
+    : `https://generativelanguage.googleapis.com/v1/models/${model}:generateContent`; // sadece v1 kullanıyoruz
+  const r = await fetch(`${base}?key=${GEMINI_API_KEY}`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ contents: [{ role: "user", parts: [{ text: finalPrompt }] }], generationConfig: { temperature } })
+  });
+  if (!r.ok) { const txt = await r.text(); const e = new Error("gemini_http_" + r.status); e.body = txt; throw e; }
+  const j = await r.json();
+  return j?.candidates?.[0]?.content?.parts?.[0]?.text ?? "";
+}
 
-  let last = null;
-  for (const v of versions) {
-    for (const m of models) {
-      try {
-        const url = `https://generativelanguage.googleapis.com/${v}/models/${encodeURIComponent(m)}:generateContent?key=${encodeURIComponent(GEMINI_API_KEY)}`;
-        const r = await fetch(url, {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ contents: [{ parts: [{ text: prompt }] }] })
-        });
-        const text = await r.text();
-        if (!r.ok) { last = { error: "gemini_http_" + r.status, body: text, version: v, model: m }; continue; }
-        const j = JSON.parse(text);
-        const output = j?.candidates?.[0]?.content?.parts?.[0]?.text ?? "";
-        return { ok: true, provider: "gemini", output, version: v, model: m };
-      } catch (e) {
-        last = { error: "gemini_exception", detail: String(e), version: v, model: m };
-      }
-    }
+async function askGemini(finalPrompt, temperature = 0.7) {
+  let last;
+  for (const m of GEMINI_MODEL_FALLBACKS) {
+    try { return await askGeminiWithModel(finalPrompt, m, "v1", temperature); }
+    catch (e) { last = e; if (!String(e?.message).includes("gemini_http_404")) throw e; }
   }
-  return { ok: false, error: "gemini_all_failed", last };
+  const err = new Error("gemini_all_failed"); err.last = last; throw err;
 }
 
 module.exports = async (req, res) => {
-  // CORS
   res.setHeader("Access-Control-Allow-Origin", "*");
   res.setHeader("Access-Control-Allow-Headers", "Content-Type");
   res.setHeader("Access-Control-Allow-Methods", "GET,POST,OPTIONS");
   if (req.method === "OPTIONS") return res.status(200).end();
 
-  // GET → sağlık
   if (req.method === "GET") {
-    const provider = OPENAI_API_KEY ? "openai" : (GEMINI_API_KEY ? "gemini" : "none");
     return res.status(200).json({
       ok: true,
-      provider,
+      provider: OPENAI_API_KEY ? "openai" : (GEMINI_API_KEY ? "gemini" : "none"),
       openai_model: OPENAI_MODEL,
-      gemini_model: GEMINI_MODEL,
+      gemini_model: GEMINI_MODEL_MAIN,
       gemini_api_version: GEMINI_API_VERSION
     });
   }
 
   if (req.method !== "POST") return res.status(405).json({ error: "method_not_allowed" });
 
-  // Body parse
-  let body = {};
   try {
-    body = typeof req.body === "string" ? JSON.parse(req.body || "{}"): (req.body || {});
-  } catch {
-    return res.status(400).json({ error: "bad_json" });
-  }
+    const body = typeof req.body === "string" ? JSON.parse(req.body || "{}"): (req.body || {});
+    const prompt = String(body?.prompt || "").trim();
+    const lang = String(body?.lang || "tr");
+    const provider = String(body?.provider || "").trim().toLowerCase();
+    const temperature = typeof body?.temperature === "number" ? body.temperature : 0.7;
+    if (!prompt) return res.status(400).json({ error: "prompt_required" });
 
-  const rawPrompt   = String(body.prompt || "").trim();
-  const lang        = String(body.lang || "tr");
-  const temperature = typeof body.temperature === "number" ? body.temperature : 0.7;
-  if (!rawPrompt) return res.status(400).json({ error: "prompt_required" });
+    const finalPrompt = `${langInstruction(lang)}\n\n${prompt}`;
 
-  const instruction =
-      lang === "de" ? "Antworten Sie ausschließlich auf Deutsch."
-    : lang === "fr" ? "Répondez uniquement en français."
-    : lang === "ar" ? "يرجى الإجابة باللغة العربية فقط."
-    : lang === "tr" ? "Lütfen yalnızca Türkçe yanıt ver."
-    : "Please respond in English only.";
-  const prompt = `${instruction}\n\n${rawPrompt}`;
+    if (provider === "openai")  return res.status(200).json({ ok: true, provider: "openai",  output: await askOpenAI(finalPrompt, temperature),  lang });
+    if (provider === "gemini")  return res.status(200).json({ ok: true, provider: "gemini",  output: await askGemini(finalPrompt, temperature),  lang });
 
-  const wanted =
-    body.provider || (OPENAI_API_KEY ? "openai" : (GEMINI_API_KEY ? "gemini" : "none"));
-
-  // OPENAI zorla
-  if (wanted === "openai") {
-    const r = await askOpenAI(prompt, temperature);
-    return r.ok
-      ? res.status(200).json({ provider: r.provider, output: r.output, lang })
-      : res.status(502).json(r);
-  }
-
-  // GEMINI zorla
-  if (wanted === "gemini") {
-    const r = await askGemini(prompt);
-    return r.ok
-      ? res.status(200).json({ provider: r.provider, output: r.output, lang, version: r.version, model: r.model })
-      : res.status(502).json(r);
-  }
-
-  // OTOMATİK: önce OpenAI, olmazsa Gemini
-  if (OPENAI_API_KEY) {
-    const o = await askOpenAI(prompt, temperature);
-    if (o.ok) return res.status(200).json({ provider: o.provider, output: o.output, lang });
-    if (GEMINI_API_KEY) {
-      const g = await askGemini(prompt);
-      return g.ok
-        ? res.status(200).json({ provider: g.provider, output: g.output, lang, fallback: "from_openai_error", version: g.version, model: g.model })
-        : res.status(502).json({ error: "both_failed", openai: o, gemini: g });
+    // Otomatik: önce OpenAI, 401/403/429 gelirse Gemini
+    if (OPENAI_API_KEY) {
+      try { return res.status(200).json({ ok: true, provider: "openai", output: await askOpenAI(finalPrompt, temperature), lang }); }
+      catch (e) {
+        const msg = String(e?.message || "");
+        const fallback = msg.includes("openai_http_401") || msg.includes("openai_http_403") || msg.includes("openai_http_429") || msg.includes("openai_no_key");
+        if (!fallback || !GEMINI_API_KEY) throw e;
+      }
     }
-    return res.status(502).json(o);
+    return res.status(200).json({ ok: true, provider: "gemini", output: await askGemini(finalPrompt, temperature), lang });
+  } catch (e) {
+    return res.status(500).json({ error: "handler_crashed", detail: String(e?.stack || e) });
   }
-
-  if (GEMINI_API_KEY) {
-    const g = await askGemini(prompt);
-    return g.ok
-      ? res.status(200).json({ provider: g.provider, output: g.output, lang, version: g.version, model: g.model })
-      : res.status(502).json(g);
-  }
-
-  return res.status(500).json({ error: "no_provider_configured" });
 };
